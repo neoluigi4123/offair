@@ -1,5 +1,10 @@
 # Offair ⚡
 
+> [!NOTE]
+> **This script is partially AI assisted.**
+>
+> AI was used for audio handling and storing, alongside the radio system.
+
 Offair is a music player designed specifically for low-end connexion, optimizing listening over buffering time.
 
 It is using one thread to download songs as it goes. You can use youtube sessions cookies by exporting them as `.txt`, allowing more relevent recommandation.
