@@ -3,7 +3,7 @@
 > [!NOTE]
 > **This script is partially AI assisted.**
 >
-> AI was used for audio handling and storing, alongside the radio system and overall codebase review (the code was done in a single take mid-night).
+> AI was used for audio handling and storing, alongside the radio system and overall codebase review (the base code was done in a single take mid-night).
 >
 > AI wasn't used for the app logic design (app behavior), and interface design.
 
@@ -29,6 +29,18 @@ One single command to install depedencies:
 
 Then launch youtube_music.py and enjoy.
 
+About the session cookies to sync the app with your youtube account:
+
+- Open a private tab in your browser
+
+- Go to `youtube.com`
+
+- Login onto your account
+
+- Extract your cookies using an extension such as *Get Cookies.txt LOCALLY*
+
+- Setup the path to your cookies in the app.
+
 ## Configuration
 
 In the top-right corner on the webapp, there is 4 settings:
@@ -40,3 +52,5 @@ In the top-right corner on the webapp, there is 4 settings:
 - Target song length -> When radio auto-fill is enabled, songs are ranked based on length and recommandation position.
 
 - cookies.txt filepath -> Optional, this allow the radio to use existing cookies as base to recommand songs. It will not refine your youtube algorith and is read-only.
+
+- *Add played song to youtube history* -> (pretty self-explanatory). Works only when cookies.txt are configured.
