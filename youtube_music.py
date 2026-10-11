@@ -39,7 +39,7 @@ import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Iterator, Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 try:
     import yt_dlp
@@ -58,11 +58,13 @@ VAULT_DIR = BASE_DIR / "music_vault"
 VAULT_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = BASE_DIR / "library.db"
 SETTINGS_PATH = BASE_DIR / "settings.json"
+COOKIE_STATUS_PATH = BASE_DIR / "cookie_status.json"
 
 DEFAULT_SETTINGS = {
     "bitrate": 48,
     "cookies_file": r"C:\Users\pc\Downloads\www.youtube.com_cookies.txt",
     "radio_autofill": True,
+    "account_history": False,  # mark played songs as watched on the cookies' Google account
     "max_length_min": 10,    # Radio and Search hide songs longer than this (0 = no limit)
     "target_length_min": 4,  # Radio autofill favours songs close to this length (0 = ignore length)
 }
@@ -290,6 +292,66 @@ def _post_json(url: str, payload: dict, headers: dict, timeout: int = 30) -> dic
     return json.loads(raw)
 
 
+# Last logged-in answer YouTube gave for a cookies file, as (cookies signature, logged in).
+COOKIE_LAST_ANSWER: Optional[tuple[str, bool]] = None
+
+
+def _cookie_sig(cookie_header: str) -> str:
+    return hashlib.sha1(cookie_header.encode("utf-8")).hexdigest()
+
+
+def _cookies_worked_sig() -> Optional[str]:
+    try:
+        with open(COOKIE_STATUS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f).get("worked_sig")
+    except (OSError, ValueError):
+        return None
+
+
+def _logged_in(data: dict) -> Optional[bool]:
+    """YouTube's own verdict on whether a response was served to a logged-in user."""
+    values = [
+        p.get("value") == "1"
+        for service in (data.get("responseContext") or {}).get("serviceTrackingParams") or []
+        for p in service.get("params") or []
+        if p.get("key") == "logged_in"
+    ]
+    return any(values) if values else None
+
+
+def note_cookie_answer(auth: dict, data: dict) -> Optional[bool]:
+    """Records whether a request sent with cookies came back logged in."""
+    global COOKIE_LAST_ANSWER
+    logged_in = _logged_in(data)
+    if not auth.get("Cookie") or logged_in is None:
+        return logged_in
+    sig = _cookie_sig(auth["Cookie"])
+    COOKIE_LAST_ANSWER = (sig, logged_in)
+    if logged_in and _cookies_worked_sig() != sig:
+        try:
+            with open(COOKIE_STATUS_PATH, "w", encoding="utf-8") as f:
+                json.dump({"worked_sig": sig}, f)
+        except OSError as e:
+            log.warning("Could not save cookie status: %s", e)
+    return logged_in
+
+
+def cookies_expired() -> bool:
+    """
+    True only when a cookies file is set and exists, these exact cookies were
+    accepted at least once, and YouTube's latest answer for them was logged out.
+    """
+    path = (load_settings().get("cookies_file") or "").strip()
+    if not path or not os.path.isfile(path) or COOKIE_LAST_ANSWER is None:
+        return False
+    jar = load_youtube_cookies(path)
+    if not jar:
+        return False
+    sig = _cookie_sig("; ".join(f"{k}={v}" for k, v in jar.items()))
+    last_sig, logged_in = COOKIE_LAST_ANSWER
+    return last_sig == sig and not logged_in and _cookies_worked_sig() == sig
+
+
 def _cookie_headers(origin: str) -> dict:
     """Cookie + SAPISIDHASH headers so YouTube personalises Radio, if cookies are set."""
     path = (load_settings().get("cookies_file") or "").strip()
@@ -315,7 +377,9 @@ def _post_with_optional_auth(url: str, payload: dict, headers: dict, origin: str
     last_error: Optional[Exception] = None
     for extra in ([auth, {}] if auth else [{}]):
         try:
-            return _post_json(url, payload, {**headers, **extra})
+            data = _post_json(url, payload, {**headers, **extra})
+            note_cookie_answer(extra, data)
+            return data
         except urllib.error.HTTPError as e:
             last_error = e
             if extra:
@@ -365,10 +429,9 @@ def _fetch_ytm_radio(seed_id: str) -> list[dict]:
     data = _post_with_optional_auth(f"{origin}/youtubei/v1/next?prettyPrint=false", payload, headers, origin)
 
     global RADIO_PERSONALISED
-    for service in (data.get("responseContext") or {}).get("serviceTrackingParams") or []:
-        for p in service.get("params") or []:
-            if p.get("key") == "logged_in":
-                RADIO_PERSONALISED = p.get("value") == "1"
+    logged_in = _logged_in(data)
+    if logged_in is not None:
+        RADIO_PERSONALISED = logged_in
 
     tracks = []
     for r in _find_all(data, "playlistPanelVideoRenderer"):
@@ -383,6 +446,57 @@ def _fetch_ytm_radio(seed_id: str) -> list[dict]:
             "url": watch_url(vid),
         })
     return tracks
+
+
+CPN_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+
+def mark_watched_on_account(video_id: str) -> None:
+    """
+    Adds a song to the cookies' account history, the way the YouTube player does:
+    fetch the logged-in player response, then send its playback ping.
+    Uses the WEB client: YouTube Music's WEB_REMIX player answers "Video
+    unavailable" without the browser's anti-bot tokens.
+    Raises RuntimeError when the cookies are missing or YouTube ignores them.
+    """
+    origin = "https://www.youtube.com"
+    auth = _cookie_headers(origin)
+    if not auth:
+        raise RuntimeError("no cookies file set")
+    payload = {
+        "context": {
+            "client": {"clientName": "WEB", "clientVersion": WEB_CLIENT_VERSION, "hl": "en", "gl": "US"}
+        },
+        "videoId": video_id,
+    }
+    headers = {
+        "Origin": origin,
+        "X-YouTube-Client-Name": "1",
+        "X-YouTube-Client-Version": WEB_CLIENT_VERSION,
+        **auth,
+    }
+    data = _post_json(f"{origin}/youtubei/v1/player?prettyPrint=false", payload, headers)
+
+    if not note_cookie_answer(auth, data):
+        raise RuntimeError("YouTube did not accept the cookies (expired?)")
+    base = ((data.get("playbackTracking") or {}).get("videostatsPlaybackUrl") or {}).get("baseUrl")
+    if not base:
+        raise RuntimeError("no playback tracking URL in the player response")
+
+    parsed = urlparse(base)
+    qs = parse_qs(parsed.query)
+    qs.update({
+        "ver": ["2"],
+        "cpn": ["".join(random.choice(CPN_ALPHABET) for _ in range(16))],
+        "fs": ["0"],
+    })
+    ping = parsed._replace(query=urlencode(qs, doseq=True)).geturl()
+    req = urllib.request.Request(
+        ping,
+        headers={"User-Agent": BROWSER_UA, "Origin": origin, "Referer": f"{origin}/", "Cookie": auth["Cookie"]},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        resp.read()
 
 
 def _fetch_web_related(seed_id: str) -> list[dict]:
@@ -574,6 +688,7 @@ class PrefetchEngine:
         self.status_map: dict[str, dict] = {}
         self.failures: dict[str, tuple[int, float]] = {}  # id -> (attempts, retry_after)
         self.history: list[str] = []
+        self.pending_marks: list[str] = []  # played songs waiting to be marked on the account
         self.radio_enabled = bool(load_settings().get("radio_autofill", True))
         self.radio_exhausted_sig: Optional[tuple] = None
 
@@ -900,6 +1015,28 @@ class PrefetchEngine:
             "tracks": tracks,
         }
 
+    def note_played(self, video_id: str) -> None:
+        """Called when the player actually starts a song."""
+        if not VIDEO_ID_RE.match(video_id or "") or not load_settings().get("account_history"):
+            return
+        with self.lock:
+            if video_id not in self.pending_marks:
+                self.pending_marks.append(video_id)
+        self.wake.set()
+
+    def _history_step(self) -> bool:
+        """Marks one played song on the account. Idle-time work, like Radio."""
+        with self.lock:
+            if not self.pending_marks:
+                return False
+            vid = self.pending_marks.pop(0)
+        try:
+            mark_watched_on_account(vid)
+            log.info("Account history: marked %s as watched", vid)
+        except Exception as e:
+            log.warning("Account history: could not mark %s: %s", vid, e)
+        return True
+
     def _worker_loop(self) -> None:
         while True:
             self.wake.clear()
@@ -909,6 +1046,9 @@ class PrefetchEngine:
 
             if track:
                 self._download_track(track)
+                continue
+
+            if self._history_step():
                 continue
 
             try:
@@ -1064,6 +1204,7 @@ class PrefetchEngine:
                 "active_download_id": self.active_download_id,
                 "radio_enabled": self.radio_enabled,
                 "radio_sig": ",".join(sid for sid, _, _ in self._radio_seeds()),
+                "cookies_expired": cookies_expired(),
             }
 
 
@@ -1138,13 +1279,15 @@ class ThreadedAudioRequestHandler(BaseHTTPRequestHandler):
                 ENGINE.remove(int(body.get("index", 0)))
             elif path == "/api/queue/clear":
                 ENGINE.clear_upcoming()
+            elif path == "/api/played":
+                ENGINE.note_played(str(body.get("id", "")))
             elif path == "/api/library/delete":
                 error = ENGINE.delete_from_vault(str(body.get("id", "")))
                 if error:
                     result = {"ok": False, "error": error}
             elif path == "/api/settings":
                 settings = load_settings()
-                for key in ("bitrate", "cookies_file", "radio_autofill", "max_length_min", "target_length_min"):
+                for key in ("bitrate", "cookies_file", "radio_autofill", "account_history", "max_length_min", "target_length_min"):
                     if key in body:
                         settings[key] = body[key]
                 save_settings(settings)
@@ -1320,6 +1463,8 @@ EMBEDDED_UI = r"""<!DOCTYPE html>
   .net.busy .dot { background: var(--accent); animation: pulse 1.4s ease-in-out infinite; }
   .net.err { color: var(--danger); }
   .net.err .dot { background: var(--danger); }
+  .cookie-warn { flex: none; height: 24px; padding: 0 10px; border: 0; border-radius: 12px; background: var(--danger-dim); color: var(--danger); font: 700 11px var(--sans); cursor: pointer; }
+  .cookie-warn[hidden] { display: none; }
   @keyframes pulse { 50% { opacity: .3; } }
 
   /* Panes */
@@ -1426,7 +1571,7 @@ EMBEDDED_UI = r"""<!DOCTYPE html>
   .modal { width: min(460px, calc(100vw - 32px)); display: flex; flex-direction: column; gap: 18px; padding: 24px; background: var(--panel); border: 1px solid var(--line-strong); border-radius: 10px; }
   .modal h3 { font: 800 20px var(--display); letter-spacing: -0.02em; }
   .field { display: flex; flex-direction: column; gap: 7px; }
-  .field select, .field input { height: 38px; padding: 0 10px; background: var(--raise); border: 1px solid var(--line); border-radius: var(--radius); color: var(--text); font: inherit; }
+  .field select, .field input:not([type=checkbox]) { height: 38px; padding: 0 10px; background: var(--raise); border: 1px solid var(--line); border-radius: var(--radius); color: var(--text); font: inherit; }
   .field .hint { font-size: 12px; color: var(--faint); }
   .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   .unit { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
@@ -1457,6 +1602,7 @@ EMBEDDED_UI = r"""<!DOCTYPE html>
       <button class="tab" data-view="radio">Radio</button>
     </nav>
     <div class="spacer"></div>
+    <button class="cookie-warn" id="cookieWarn" hidden title="YouTube no longer accepts your cookies file, so Radio is not personalised and history is not saved. Export a fresh cookies.txt (from a private window you then close) and replace the file.">Cookies expired</button>
     <div class="net" id="net"><i class="dot"></i><span id="netText">Idle</span></div>
     <button class="ib" id="settingsBtn" title="Settings" aria-label="Settings"></button>
   </header>
@@ -1534,7 +1680,11 @@ EMBEDDED_UI = r"""<!DOCTYPE html>
     <div class="field">
       <span class="label">Cookies file (optional)</span>
       <input type="text" id="cfgCookies" placeholder="C:\Users\you\Downloads\www.youtube.com_cookies.txt">
-      <span class="hint">Netscape cookies.txt. Only used to personalise Radio; downloads never send cookies.</span>
+      <span class="hint">Netscape cookies.txt. Used to personalise Radio and, if enabled below, your history; downloads never send cookies.</span>
+    </div>
+    <div class="field">
+      <label class="switch">Add played songs to my YouTube history <input type="checkbox" id="cfgHistory"></label>
+      <span class="hint">Needs the cookies file. Each song is marked once it starts playing, when no download is running.</span>
     </div>
     <div class="foot">
       <button class="btn" id="cfgCancel">Cancel</button>
@@ -1884,6 +2034,7 @@ async function sync() {
   if (document.activeElement !== tog) tog.checked = !!state.radio_enabled;
   renderQueue();
   renderNet();
+  $('cookieWarn').hidden = !state.cookies_expired;
   reconcilePlayer();
 }
 
@@ -1937,6 +2088,15 @@ async function deleteTrack(id) {
   if (res && res.ok) toast('Removed from vault');
   loadLibrary();
 }
+
+// Tell the server once per load that a song really started, for account history.
+let reportedId = null;
+audio.addEventListener('playing', () => {
+  if (loadedId && loadedId !== reportedId) {
+    reportedId = loadedId;
+    api('/api/played', { id: loadedId }).catch(() => {});
+  }
+});
 
 audio.addEventListener('ended', async () => {
   const t = target();
@@ -2138,18 +2298,21 @@ async function openSettings() {
   const s = await api('/api/settings');
   $('cfgBitrate').value = String(s.bitrate || 48);
   $('cfgCookies').value = s.cookies_file || '';
+  $('cfgHistory').checked = !!s.account_history;
   $('cfgMaxLen').value = s.max_length_min ?? 10;
   $('cfgTargetLen').value = s.target_length_min ?? 4;
   $('settingsModal').classList.add('open');
 }
 function closeSettings() { $('settingsModal').classList.remove('open'); }
 $('settingsBtn').addEventListener('click', openSettings);
+$('cookieWarn').addEventListener('click', openSettings);
 $('cfgCancel').addEventListener('click', closeSettings);
 $('settingsModal').addEventListener('click', (e) => { if (e.target.id === 'settingsModal') closeSettings(); });
 $('cfgSave').addEventListener('click', async () => {
   await api('/api/settings', {
     bitrate: parseInt($('cfgBitrate').value, 10),
     cookies_file: $('cfgCookies').value.trim(),
+    account_history: $('cfgHistory').checked,
     max_length_min: Math.max(0, Number($('cfgMaxLen').value) || 0),
     target_length_min: Math.max(0, Number($('cfgTargetLen').value) || 0),
   });
