@@ -3,7 +3,9 @@
 > [!NOTE]
 > **This script is partially AI assisted.**
 >
-> AI was used for audio handling and storing, alongside the radio system.
+> AI was used for audio handling and storing, alongside the radio system and overall codebase review (the code was done in a single take mid-night).
+>
+> AI wasn't used for the app logic design (app behavior), and interface design.
 
 Offair is a music player designed specifically for low-end connexion, optimizing listening over buffering time.
 
