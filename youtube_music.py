@@ -202,8 +202,15 @@ def init_db() -> None:
         """
         )
         columns = {row[1] for row in conn.execute("PRAGMA table_info(tracks)")}
-        if "duration" not in columns:
-            conn.execute("ALTER TABLE tracks ADD COLUMN duration TEXT DEFAULT ''")
+        for name, ddl in (
+            ("duration", "TEXT DEFAULT ''"),
+            ("play_count", "INTEGER DEFAULT 0"),      # listens of at least 30 s (or half the song)
+            ("listen_seconds", "REAL DEFAULT 0"),     # time actually spent playing this song
+            ("last_played_at", "REAL DEFAULT 0"),
+        ):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE tracks ADD COLUMN {name} {ddl}")
+        conn.execute("CREATE TABLE IF NOT EXISTS stats (key TEXT PRIMARY KEY, value REAL NOT NULL)")
         conn.commit()
 
 
@@ -211,7 +218,8 @@ def db_get_all_tracks() -> list[dict]:
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT id, title, uploader, duration, filename, downloaded_at "
+            "SELECT id, title, uploader, duration, filename, downloaded_at, "
+            "COALESCE(play_count, 0) AS play_count, COALESCE(listen_seconds, 0) AS listen_seconds "
             "FROM tracks ORDER BY downloaded_at DESC"
         ).fetchall()
     # Hide rows whose file was removed outside the app.
@@ -222,10 +230,14 @@ def db_add_track(info: dict, filename: str) -> None:
     duration = info.get("duration")
     duration = fmt_duration(duration) if isinstance(duration, (int, float)) else (duration or "")
     with sqlite3.connect(DB_PATH) as conn:
+        # Upsert rather than REPLACE, so a re-download keeps the song's play stats.
         conn.execute(
             """
-            INSERT OR REPLACE INTO tracks (id, title, uploader, filename, downloaded_at, duration)
+            INSERT INTO tracks (id, title, uploader, filename, downloaded_at, duration)
             VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title, uploader = excluded.uploader, filename = excluded.filename,
+                downloaded_at = excluded.downloaded_at, duration = excluded.duration
         """,
             (
                 info.get("id"),
@@ -243,6 +255,89 @@ def db_delete_track(video_id: str) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("DELETE FROM tracks WHERE id = ?", (video_id,))
         conn.commit()
+
+
+# -----------------------------------------------------------------------------
+# Listening stats
+# -----------------------------------------------------------------------------
+class ListenStats:
+    """
+    Time spent actually listening, all time and per session, plus per-song play counts.
+
+    The player measures playing time itself (paused or buffering time is never
+    counted) and reports it every few seconds. A session ends after
+    SESSION_GAP seconds without any listening.
+    """
+
+    SESSION_GAP = 30 * 60
+    MAX_REPORT_SEC = 6 * 3600  # sanity cap on a single report per song
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.total = 0.0
+        self.session = 0.0
+        self.last_at = 0.0
+        # Lets the UI drop answers older than the one it already has; starts from
+        # the clock so it keeps growing across restarts.
+        self.seq = int(time.time() * 1000)
+
+    def load(self) -> None:
+        with sqlite3.connect(DB_PATH) as conn:
+            values = dict(conn.execute("SELECT key, value FROM stats").fetchall())
+        with self.lock:
+            self.total = float(values.get("listen_total", 0.0))
+            self.session = float(values.get("listen_session", 0.0))
+            self.last_at = float(values.get("listen_last_at", 0.0))
+
+    def add(self, seconds_by_id: dict, plays: list) -> None:
+        if not isinstance(seconds_by_id, dict) or not isinstance(plays, list):
+            raise ValueError("Expected {tracks: {id: seconds}, plays: [id]}")
+        clean = {
+            vid: float(secs)
+            for vid, secs in seconds_by_id.items()
+            if VIDEO_ID_RE.match(str(vid))
+            and isinstance(secs, (int, float))
+            and 0 < secs <= self.MAX_REPORT_SEC
+        }
+        plays = [str(p) for p in plays if VIDEO_ID_RE.match(str(p))]
+        if not clean and not plays:
+            return
+        now = time.time()
+        with self.lock:
+            added = sum(clean.values())
+            if added:
+                if now - self.last_at > self.SESSION_GAP:
+                    self.session = 0.0
+                self.session += added
+                self.total += added
+                self.last_at = now
+            self.seq += 1
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO stats (key, value) VALUES (?, ?)",
+                    [("listen_total", self.total), ("listen_session", self.session), ("listen_last_at", self.last_at)],
+                )
+                conn.executemany(
+                    "UPDATE tracks SET listen_seconds = COALESCE(listen_seconds, 0) + ? WHERE id = ?",
+                    [(secs, vid) for vid, secs in clean.items()],
+                )
+                conn.executemany(
+                    "UPDATE tracks SET play_count = COALESCE(play_count, 0) + 1, last_played_at = ? WHERE id = ?",
+                    [(now, vid) for vid in plays],
+                )
+                conn.commit()
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            expired = time.time() - self.last_at > self.SESSION_GAP
+            return {
+                "total": round(self.total, 1),
+                "session": 0.0 if expired else round(self.session, 1),
+                "seq": self.seq,
+            }
+
+
+LISTEN = ListenStats()
 
 
 # -----------------------------------------------------------------------------
@@ -1216,8 +1311,9 @@ ENGINE = PrefetchEngine()
 # -----------------------------------------------------------------------------
 class ThreadedAudioRequestHandler(BaseHTTPRequestHandler):
     def log_request(self, code="-", size="-"):
-        # The UI polls /api/state every second; don't flood the console with it.
-        if self.path.startswith("/api/state") and str(code).startswith("2"):
+        # The UI polls /api/state every second and reports listening time every
+        # few seconds; don't flood the console with either.
+        if self.path.startswith(("/api/state", "/api/listen")) and str(code).startswith("2"):
             return
         super().log_request(code, size)
 
@@ -1240,7 +1336,7 @@ class ThreadedAudioRequestHandler(BaseHTTPRequestHandler):
         elif path.startswith("/api/audio/"):
             self._serve_audio_range(path)
         elif path == "/api/state":
-            self._json_response(ENGINE.get_state())
+            self._json_response({**ENGINE.get_state(), "listen": LISTEN.snapshot()})
         elif path == "/api/library":
             self._json_response(db_get_all_tracks())
         elif path == "/api/settings":
@@ -1281,6 +1377,9 @@ class ThreadedAudioRequestHandler(BaseHTTPRequestHandler):
                 ENGINE.clear_upcoming()
             elif path == "/api/played":
                 ENGINE.note_played(str(body.get("id", "")))
+            elif path == "/api/listen":
+                LISTEN.add(body.get("tracks") or {}, body.get("plays") or [])
+                result["listen"] = LISTEN.snapshot()
             elif path == "/api/library/delete":
                 error = ENGINE.delete_from_vault(str(body.get("id", "")))
                 if error:
@@ -1465,6 +1564,10 @@ EMBEDDED_UI = r"""<!DOCTYPE html>
   .net.err .dot { background: var(--danger); }
   .cookie-warn { flex: none; height: 24px; padding: 0 10px; border: 0; border-radius: 12px; background: var(--danger-dim); color: var(--danger); font: 700 11px var(--sans); cursor: pointer; }
   .cookie-warn[hidden] { display: none; }
+  .listen { display: flex; align-items: baseline; gap: 18px; flex: none; font: 600 12.5px var(--mono); color: var(--text); font-variant-numeric: tabular-nums; }
+  .listen span { white-space: nowrap; }
+  .listen i { margin-right: 7px; font: 700 10px var(--sans); font-style: normal; letter-spacing: .12em; text-transform: uppercase; color: var(--faint); }
+  .listen.live #lsSession { color: var(--accent); }
   @keyframes pulse { 50% { opacity: .3; } }
 
   /* Panes */
@@ -1476,9 +1579,14 @@ EMBEDDED_UI = r"""<!DOCTYPE html>
   .head .sub { margin-top: 6px; color: var(--muted); font-size: 13px; }
   .head .sub b { color: var(--text); font-weight: 650; }
   .qhead { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 22px 16px 12px; }
+  .qtitle { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+  .qstat { font: 11.5px var(--mono); color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+  .qstat b { color: var(--muted); font-weight: 600; }
   .label { font: 700 11px/1 var(--sans); letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
   .search { display: none; align-items: center; gap: 10px; max-width: 560px; height: 44px; margin-top: 16px; padding: 0 14px; background: var(--raise); border: 1px solid var(--line); border-radius: var(--radius); color: var(--faint); }
   .search.show { display: flex; }
+  .search kbd { flex: none; padding: 1px 6px; border: 1px solid var(--line-strong); border-radius: 4px; font: 11px var(--mono); color: var(--faint); }
+  .search:focus-within kbd { display: none; }
   .search:focus-within { border-color: var(--line-strong); color: var(--muted); }
   .search input { flex: 1; min-width: 0; background: none; border: 0; outline: 0; color: var(--text); font: inherit; font-size: 15px; }
   .search input::placeholder { color: var(--faint); }
@@ -1496,6 +1604,8 @@ EMBEDDED_UI = r"""<!DOCTYPE html>
   .a { font-size: 12.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .d { font: 12px var(--mono); color: var(--faint); }
   .row.now .t, .row.now .idx { color: var(--accent); }
+  .plays { flex: none; font: 11px var(--mono); color: var(--faint); }
+  .plays.hot { color: var(--muted); }
   .acts { display: flex; gap: 2px; opacity: 0; transition: opacity .12s; }
   .row:hover .acts, .row:focus-within .acts { opacity: 1; }
   @media (hover: none) { .acts { opacity: 1; } }
@@ -1552,6 +1662,11 @@ EMBEDDED_UI = r"""<!DOCTYPE html>
   .ctrls .ib { color: var(--text); }
   .pp { width: 38px; height: 38px; border-radius: 50%; display: grid; place-items: center; background: var(--text); color: var(--bg); transition: transform .1s; }
   .pp:hover { transform: scale(1.05); }
+  .ctrls .gap { width: 32px; height: 32px; }
+  .ctrls .ib.toggle { position: relative; color: var(--muted); }
+  .ctrls .ib.toggle:hover { color: var(--text); }
+  .ctrls .ib.toggle.on { color: var(--accent); }
+  .ctrls .ib.toggle.on::after { content: ""; position: absolute; left: 50%; bottom: 2px; width: 4px; height: 4px; margin-left: -2px; border-radius: 50%; background: var(--accent); }
   .seek { display: flex; align-items: center; gap: 10px; width: 100%; font: 11.5px var(--mono); color: var(--faint); }
   .seek span { width: 40px; }
   .seek span:first-child { text-align: right; }
@@ -1583,12 +1698,16 @@ EMBEDDED_UI = r"""<!DOCTYPE html>
   @media (max-width: 880px) {
     .top { gap: 12px; padding: 0 16px; }
     .net { display: none; }
+    .listen { gap: 12px; }
     .body { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 38%); }
     .pane + .pane { border-left: 0; border-top: 1px solid var(--line); }
     .head { padding: 18px 16px 10px; }
     .head h1 { font-size: 24px; }
     .player { grid-template-columns: minmax(0, 1fr); height: auto; gap: 8px; padding: 12px 16px; }
     .aux { display: none; }
+  }
+  @media (max-width: 600px) {
+    .listen .all { display: none; }
   }
 </style>
 </head>
@@ -1603,6 +1722,10 @@ EMBEDDED_UI = r"""<!DOCTYPE html>
     </nav>
     <div class="spacer"></div>
     <button class="cookie-warn" id="cookieWarn" hidden title="YouTube no longer accepts your cookies file, so Radio is not personalised and history is not saved. Export a fresh cookies.txt (from a private window you then close) and replace the file.">Cookies expired</button>
+    <div class="listen" id="listen" title="Time spent actually listening; paused or buffering time is not counted. A session ends after 30 minutes without music.">
+      <span><i>Session</i><b id="lsSession">0:00</b></span>
+      <span class="all"><i>All time</i><b id="lsTotal">0m</b></span>
+    </div>
     <div class="net" id="net"><i class="dot"></i><span id="netText">Idle</span></div>
     <button class="ib" id="settingsBtn" title="Settings" aria-label="Settings"></button>
   </header>
@@ -1616,12 +1739,20 @@ EMBEDDED_UI = r"""<!DOCTYPE html>
           <span id="searchIcon"></span>
           <input type="text" id="searchInput" placeholder="Artist, song, or a YouTube link" autocomplete="off" spellcheck="false">
         </label>
+        <label class="search" id="vaultBox">
+          <span id="vaultIcon"></span>
+          <input type="text" id="vaultInput" placeholder="Filter your vault by song or artist" autocomplete="off" spellcheck="false">
+          <kbd>/</kbd>
+        </label>
       </div>
       <div class="list" id="mainList"></div>
     </section>
     <aside class="pane">
       <div class="qhead">
-        <span class="label">Queue</span>
+        <div class="qtitle">
+          <span class="label">Queue</span>
+          <span class="qstat" id="queueStats"></span>
+        </div>
         <label class="switch" title="Keep the queue topped up with similar tracks">Radio autofill <input type="checkbox" id="radioToggle"></label>
       </div>
       <div class="list" id="queueList"></div>
@@ -1636,9 +1767,11 @@ EMBEDDED_UI = r"""<!DOCTYPE html>
     </div>
     <div class="transport">
       <div class="ctrls">
+        <span class="gap" aria-hidden="true"></span>
         <button class="ib" id="prevBtn" title="Previous" aria-label="Previous"></button>
         <button class="pp" id="ppBtn" title="Play / pause" aria-label="Play or pause"></button>
         <button class="ib" id="nextBtn" title="Next" aria-label="Next"></button>
+        <button class="ib toggle" id="repeatBtn" title="Repeat this song (R)" aria-label="Repeat this song" aria-pressed="false"></button>
       </div>
       <div class="seek">
         <span id="curTime">0:00</span>
@@ -1703,6 +1836,7 @@ const ICONS = {
   prev: '<path d="M6 5v14"/><path d="M19 5.6v12.8a.6.6 0 0 1-.9.5L9 12.5a.6.6 0 0 1 0-1l9.1-6.4a.6.6 0 0 1 .9.5z" fill="currentColor" stroke="none"/>',
   next: '<path d="M18 5v14"/><path d="M5 5.6v12.8a.6.6 0 0 0 .9.5l9.1-6.4a.6.6 0 0 0 0-1L5.9 5.1a.6.6 0 0 0-.9.5z" fill="currentColor" stroke="none"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
+  repeat: '<path d="M17 2.5l3.5 3.5L17 9.5"/><path d="M3.5 11.5V10a4 4 0 0 1 4-4h13"/><path d="M7 21.5L3.5 18 7 14.5"/><path d="M20.5 12.5V14a4 4 0 0 1-4 4h-13"/>',
   playnext: '<path d="M4 6h12M4 11h8M4 16h5"/><path d="M14 13l5 3.5-5 3.5z" fill="currentColor"/>',
   grip: '<circle cx="9" cy="6" r="1.4"/><circle cx="15" cy="6" r="1.4"/><circle cx="9" cy="12" r="1.4"/><circle cx="15" cy="12" r="1.4"/><circle cx="9" cy="18" r="1.4"/><circle cx="15" cy="18" r="1.4"/>',
   x: '<path d="M6 6l12 12M18 6L6 18"/>',
@@ -1735,7 +1869,8 @@ function toast(msg) {
 let state = { queue: [], current_index: -1, active_download_id: null, radio_enabled: true };
 let view = 'library';
 let library = [];
-let search = { query: '', results: [], status: 'idle', ctl: null, timer: null };
+let vaultQuery = '';
+let search ={ query: '', results: [], status: 'idle', ctl: null, timer: null };
 let radio = { sig: null, seeds: [], tracks: [], pending: 0, personalised: null, status: 'idle', timer: null };
 let drag = null;  // { from, to } while a queue row is being dragged
 let pendingDelete = null;
@@ -1757,8 +1892,20 @@ const isPlaying = () => !!loadedId && !audio.paused && !audio.ended;
 // ---------------------------------------------------------------------------
 // Views
 // ---------------------------------------------------------------------------
+// Case- and accent-insensitive: "beyonce" finds "Beyoncé".
+const fold = (s) => String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+
+function vaultItems() {
+  const words = fold(vaultQuery).split(/\s+/).filter(Boolean);
+  if (!words.length) return library;
+  return library.filter((t) => {
+    const hay = t._hay ??= fold(`${t.title} ${t.uploader}`);
+    return words.every((w) => hay.includes(w));
+  });
+}
+
 function itemsForView() {
-  return view === 'library' ? library : view === 'search' ? search.results : radio.tracks;
+  return view === 'library' ? vaultItems() : view === 'search' ? search.results : radio.tracks;
 }
 
 function switchView(v) {
@@ -1766,6 +1913,7 @@ function switchView(v) {
   pendingDelete = null;
   document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.view === v));
   $('searchBox').classList.toggle('show', v === 'search');
+  $('vaultBox').classList.toggle('show', v === 'library');
   if (v === 'search') $('searchInput').focus();
   if (v === 'radio') ensureRadio();
   renderMain();
@@ -1780,7 +1928,10 @@ function renderHead() {
   $('viewTitle').textContent = titles[view];
   let sub = '';
   if (view === 'library') {
-    sub = library.length ? `${library.length} track${library.length === 1 ? '' : 's'} saved for offline listening` : 'Everything you play is saved here.';
+    const shown = vaultItems().length;
+    sub = !library.length ? 'Everything you play is saved here.'
+      : vaultQuery.trim() ? `<b>${shown}</b> of ${library.length} tracks match`
+      : `${library.length} track${library.length === 1 ? '' : 's'} saved for offline listening`;
   } else if (view === 'search') {
     sub = 'Results appear as soon as YouTube answers.';
   } else {
@@ -1806,7 +1957,9 @@ function renderMain() {
 
   if (!items.length) {
     if (view === 'library') {
-      list.innerHTML = emptyState('Your vault is empty', 'Search for something to play. Each track is downloaded once and kept for offline listening.');
+      list.innerHTML = library.length
+        ? emptyState('No matches', `Nothing in your vault matches “${esc(vaultQuery.trim())}”.`, '<br><button class="btn" data-act="clear-filter">Clear filter</button>')
+        : emptyState('Your vault is empty', 'Search for something to play. Each track is downloaded once and kept for offline listening.');
     } else if (view === 'search') {
       list.innerHTML =
         search.status === 'loading' ? emptyState('Searching', 'Waiting for YouTube to answer.')
@@ -1828,10 +1981,16 @@ function renderMain() {
           ? `<button class="ib confirm" data-act="del">Delete</button>`
           : `<button class="ib danger" data-act="del" title="Delete from vault" aria-label="Delete from vault">${icon('trash')}</button>`)
       : '';
+    let plays = '';
+    if (view === 'library') {
+      const n = t.play_count || 0;
+      const heard = t.listen_seconds >= 60 ? `Listened ${fmtLong(t.listen_seconds)} in total` : 'Counted after 30 s of listening';
+      plays = `<span class="plays${n ? ' hot' : ''}" title="${heard}">${n} play${n === 1 ? '' : 's'}</span>`;
+    }
     return `
       <div class="row${t.id === loadedId ? ' now' : ''}" data-i="${i}">
         <div class="idx">${String(i + 1).padStart(2, '0')}</div>
-        <div class="info"><div class="t">${esc(t.title)}</div><div class="a">${esc(t.uploader || 'Unknown artist')}</div></div>
+        <div class="info"><div class="t">${esc(t.title)}</div><div class="meta"><span class="a">${esc(t.uploader || 'Unknown artist')}</span>${plays}</div></div>
         <div class="d">${esc(t.duration || '')}</div>
         <div class="acts">
           <button class="ib" data-act="play" title="Play" aria-label="Play">${icon('play')}</button>
@@ -1935,6 +2094,173 @@ function renderNowPlaying() {
   $('lamp').classList.toggle('on', isPlaying());
 }
 
+// '3:45' or '1:02:03' -> seconds; 0 when unknown.
+function parseDur(text) {
+  const parts = String(text || '').trim().split(':');
+  if (parts.length < 2 || !parts.every((p) => /^\d+$/.test(p))) return 0;
+  return parts.reduce((acc, p) => acc * 60 + Number(p), 0);
+}
+
+// 0:42, 3:07, 1:02:03
+function fmtClock(secs) {
+  secs = Math.max(0, Math.floor(secs || 0));
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = String(secs % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${s}` : `${m}:${s}`;
+}
+
+// 42s, 12m 05s, 3h 07m
+function fmtLong(secs) {
+  secs = Math.max(0, Math.floor(secs || 0));
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = secs % 60;
+  if (h) return `${h}h ${String(m).padStart(2, '0')}m`;
+  if (m) return `${m}m ${String(s).padStart(2, '0')}s`;
+  return `${s}s`;
+}
+
+function renderQueueStats() {
+  const q = state.queue;
+  const ci = state.current_index;
+  if (!q.length) {
+    $('queueStats').textContent = '';
+    return;
+  }
+  let total = 0;
+  let left = 0;
+  let unknown = 0;
+  q.forEach((t, i) => {
+    const playingThis = i === ci && t.id === loadedId && isFinite(audio.duration) && audio.duration > 0;
+    const secs = playingThis ? audio.duration : parseDur(t.duration);
+    if (!secs) {
+      unknown++;
+      return;
+    }
+    total += secs;
+    if (i > ci) left += secs;
+    else if (i === ci) left += playingThis ? Math.max(0, secs - audio.currentTime) : secs;
+  });
+  const plus = unknown ? '+' : '';
+  const title = unknown ? ` title="${unknown} track${unknown === 1 ? ' has' : 's have'} no known length yet"` : '';
+  $('queueStats').innerHTML =
+    `<span${title}>${q.length} track${q.length === 1 ? '' : 's'} · <b>${fmtClock(total)}${plus}</b> · ${fmtClock(left)}${plus} left</span>`;
+}
+
+// ---------------------------------------------------------------------------
+// Listening time and play counts
+// ---------------------------------------------------------------------------
+// Time is measured here, in segments that only run while the audio is really
+// playing (not paused, not buffering), and reported to the server every few
+// seconds. A play counts after 30 s, or half the song if it is shorter; with
+// repeat on, every loop counts as a new play.
+const LISTEN_FLUSH_SEC = 15;
+const listen = {
+  segStart: null,  // performance.now() when the running segment started
+  segId: null,
+  byId: {},        // unreported seconds per track
+  pending: 0,      // sum of byId
+  plays: [],       // unreported plays
+  inflight: 0,     // seconds sent but not yet acknowledged
+  base: null,      // last totals from the server: { total, session, seq }
+  play: null,      // current play-through: { id, heard, counted }
+  waiting: false,  // the audio is buffering
+  lastPos: 0,
+};
+
+function credit(id, secs) {
+  if (!id || !(secs > 0)) return;
+  listen.byId[id] = (listen.byId[id] || 0) + secs;
+  listen.pending += secs;
+  const p = listen.play;
+  if (p && p.id === id && !p.counted) {
+    p.heard += secs;
+    const dur = isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 60;
+    if (p.heard >= Math.min(30, dur / 2)) {
+      p.counted = true;
+      listen.plays.push(id);
+      const entry = library.find((x) => x.id === id);
+      if (entry) {
+        entry.play_count = (entry.play_count || 0) + 1;
+        if (view === 'library') renderMain();
+      }
+    }
+  }
+}
+
+function segOpen() {
+  if (listen.segStart === null && loadedId && !audio.paused && !audio.ended && !listen.waiting) {
+    listen.segStart = performance.now();
+    listen.segId = loadedId;
+  }
+}
+
+function segClose() {
+  if (listen.segStart === null) return;
+  const secs = (performance.now() - listen.segStart) / 1000;
+  listen.segStart = null;
+  credit(listen.segId, secs);
+}
+
+// Books the running segment so far and keeps it going.
+function segRoll() {
+  if (listen.segStart === null) return;
+  segClose();
+  segOpen();
+}
+
+function newPlaythrough(id) {
+  listen.play = id ? { id, heard: 0, counted: false } : null;
+}
+
+async function flushListen() {
+  if (!listen.pending && !listen.plays.length) return;
+  const body = { tracks: listen.byId, plays: listen.plays };
+  const secs = listen.pending;
+  listen.byId = {};
+  listen.pending = 0;
+  listen.plays = [];
+  listen.inflight += secs;
+  try {
+    // keepalive lets the last report go through while the page is closing.
+    const res = await fetch('/api/listen', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), keepalive: true,
+    }).then((r) => r.json());
+    if (res && res.listen) listen.base = res.listen;
+  } catch (e) {
+    // Server unreachable: keep the time and plays for the next report.
+    for (const [id, s] of Object.entries(body.tracks)) listen.byId[id] = (listen.byId[id] || 0) + s;
+    listen.pending += secs;
+    listen.plays.unshift(...body.plays);
+  } finally {
+    listen.inflight -= secs;
+  }
+}
+
+function acceptListenState(snap) {
+  // Skip while a report is on its way (its answer carries the new totals), and
+  // never step back to an older answer.
+  if (!snap || listen.inflight) return;
+  if (!listen.base || snap.seq >= listen.base.seq) listen.base = snap;
+}
+
+function renderListen() {
+  const live = listen.segStart !== null;
+  const unsent = listen.pending + listen.inflight + (live ? (performance.now() - listen.segStart) / 1000 : 0);
+  const base = listen.base || { total: 0, session: 0 };
+  $('lsSession').textContent = fmtClock(base.session + unsent);
+  $('lsTotal').textContent = fmtLong(base.total + unsent);
+  $('listen').classList.toggle('live', live);
+}
+
+function listenTick() {
+  segRoll();
+  if (listen.plays.length || listen.pending >= LISTEN_FLUSH_SEC) flushListen();
+  renderListen();
+  renderQueueStats();
+}
+
 // ---------------------------------------------------------------------------
 // Data
 // ---------------------------------------------------------------------------
@@ -1999,6 +2325,9 @@ async function runSearch(query) {
 // Playback
 // ---------------------------------------------------------------------------
 function loadTrack(t) {
+  segClose();  // book the previous song's time before switching
+  newPlaythrough(t.id);
+  listen.lastPos = 0;
   userJump = false;
   loadedId = t.id;
   loadedMeta = { ...t };
@@ -2032,7 +2361,9 @@ async function sync() {
   lastActive = state.active_download_id;
   const tog = $('radioToggle');
   if (document.activeElement !== tog) tog.checked = !!state.radio_enabled;
+  acceptListenState(state.listen);
   renderQueue();
+  renderQueueStats();
   renderNet();
   $('cookieWarn').hidden = !state.cookies_expired;
   reconcilePlayer();
@@ -2059,6 +2390,8 @@ async function playNext() {
 
 async function playPrev() {
   if (audio.currentTime > 4) {
+    segRoll();
+    newPlaythrough(loadedId);  // starting the song over is a new listen
     audio.currentTime = 0;
     return;
   }
@@ -2081,6 +2414,8 @@ async function deleteTrack(id) {
     audio.pause();
     audio.removeAttribute('src');
     audio.load();
+    segClose();
+    newPlaythrough(null);
     loadedId = null;
     loadedMeta = null;
   }
@@ -2111,6 +2446,28 @@ audio.addEventListener('ended', async () => {
 audio.addEventListener('play', () => { $('ppBtn').innerHTML = icon('pause', 18); renderNowPlaying(); });
 audio.addEventListener('pause', () => { $('ppBtn').innerHTML = icon('play', 18); renderNowPlaying(); });
 
+// Listening time only runs between 'playing' and whatever stops the sound.
+audio.addEventListener('playing', () => { listen.waiting = false; segOpen(); renderListen(); });
+audio.addEventListener('waiting', () => { listen.waiting = true; segClose(); renderListen(); });
+for (const ev of ['pause', 'ended', 'emptied', 'error']) {
+  audio.addEventListener(ev, () => {
+    segClose();
+    renderListen();
+    if (ev === 'pause' || ev === 'ended') flushListen();
+  });
+}
+window.addEventListener('pagehide', () => { segClose(); flushListen(); });
+
+const repeatBtn = $('repeatBtn');
+function setRepeat(on) {
+  audio.loop = on;  // with loop set, the song restarts by itself and 'ended' never fires
+  repeatBtn.classList.toggle('on', on);
+  repeatBtn.setAttribute('aria-pressed', String(on));
+  repeatBtn.title = on ? 'Repeat is on (R)' : 'Repeat this song (R)';
+  try { localStorage.setItem('offair.repeat', on ? '1' : '0'); } catch (e) {}
+}
+repeatBtn.addEventListener('click', () => setRepeat(!audio.loop));
+
 let seeking = false;
 const seekEl = $('seek');
 function fmt(secs) {
@@ -2121,6 +2478,12 @@ function fmt(secs) {
 }
 audio.addEventListener('timeupdate', () => {
   const dur = audio.duration || 0;
+  // Repeat jumped from the end back to the start: that begins a new listen.
+  if (audio.loop && dur && listen.lastPos > dur - 2 && audio.currentTime < 1) {
+    segRoll();
+    newPlaythrough(loadedId);
+  }
+  listen.lastPos = audio.currentTime;
   if (!seeking) {
     seekEl.max = dur || 100;
     seekEl.value = audio.currentTime || 0;
@@ -2170,11 +2533,34 @@ $('searchInput').addEventListener('input', (e) => {
   search.timer = setTimeout(() => runSearch(q), 450);
 });
 
+const vaultInput = $('vaultInput');
+function setVaultQuery(q) {
+  vaultQuery = q;
+  pendingDelete = null;
+  if (view === 'library') renderMain();
+}
+vaultInput.addEventListener('input', () => setVaultQuery(vaultInput.value));
+vaultInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && vaultInput.value) {
+    e.stopPropagation();
+    vaultInput.value = '';
+    setVaultQuery('');
+  } else if (e.key === 'Enter') {
+    $('mainList').querySelector('.row [data-act="play"]')?.click();  // Enter plays the first match
+  }
+});
+
 $('mainList').addEventListener('click', async (e) => {
   const btn = e.target.closest('[data-act]');
   if (!btn) return;
   const act = btn.dataset.act;
   if (act === 'retry-radio') return ensureRadio(true);
+  if (act === 'clear-filter') {
+    vaultInput.value = '';
+    setVaultQuery('');
+    vaultInput.focus();
+    return;
+  }
 
   const row = btn.closest('.row');
   const t = row && itemsForView()[Number(row.dataset.i)];
@@ -2281,6 +2667,13 @@ document.addEventListener('keydown', (e) => {
   if (e.code === 'Space' && !typing) {
     e.preventDefault();
     togglePlay();
+  } else if (e.key.toLowerCase() === 'r' && !typing && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    setRepeat(!audio.loop);
+    toast(audio.loop ? 'Repeat on: this song will loop' : 'Repeat off');
+  } else if (e.key === '/' && !typing) {
+    e.preventDefault();
+    if (view !== 'library' && view !== 'search') switchView('library');
+    (view === 'search' ? $('searchInput') : vaultInput).focus();
   } else if (e.key === 'Escape') {
     closeSettings();
   }
@@ -2330,14 +2723,21 @@ $('prevBtn').innerHTML = icon('prev', 18);
 $('nextBtn').innerHTML = icon('next', 18);
 $('ppBtn').innerHTML = icon('play', 18);
 $('volIcon').innerHTML = icon('volume', 16);
+$('vaultIcon').innerHTML = icon('search', 18);
+repeatBtn.innerHTML = icon('repeat', 17);
 let savedVol = 0.9;
 try { savedVol = Number(localStorage.getItem('offair.volume') ?? 0.9); } catch (e) {}
 setVolume(isFinite(savedVol) ? savedVol : 0.9);
+let savedRepeat = false;
+try { savedRepeat = localStorage.getItem('offair.repeat') === '1'; } catch (e) {}
+setRepeat(savedRepeat);
 
+$('vaultBox').classList.add('show');
 renderMain();
 loadLibrary();
 sync();
 setInterval(sync, 1000);
+setInterval(listenTick, 1000);
 </script>
 </body>
 </html>
@@ -2349,7 +2749,8 @@ setInterval(sync, 1000);
 # -----------------------------------------------------------------------------
 def run(host: str = "127.0.0.1", port: int = 8080) -> None:
     init_db()
-    httpd = ThreadingHTTPServer((host, port), ThreadedAudioRequestHandler)
+    LISTEN.load()
+    httpd =ThreadingHTTPServer((host, port), ThreadedAudioRequestHandler)
     print("=" * 60)
     print("OffAir Music  (low-bandwidth mode)")
     print(f"  Open:   http://{host}:{port}")
